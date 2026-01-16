@@ -201,6 +201,7 @@ use pyrefly_util::watch_pattern::WatchPattern;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -1130,6 +1131,43 @@ impl Server {
                         ErrorCode::RequestCanceled as i32,
                         message,
                     ));
+                    return Ok(ProcessEvent::Continue);
+                }
+
+                if x.method == "muffet/semanticSnapshotBulk" {
+                    let params = match serde_json::from_value::<MuffetSemanticSnapshotBulkParams>(
+                        x.params,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.send_response(Response::new_err(
+                                x.id,
+                                ErrorCode::InvalidParams as i32,
+                                format!("Invalid muffet/semanticSnapshotBulk params: {e}"),
+                            ));
+                            return Ok(ProcessEvent::Continue);
+                        }
+                    };
+
+                    let response = self.muffet_semantic_snapshot_bulk(
+                        ide_transaction_manager,
+                        telemetry,
+                        telemetry_event,
+                        subsequent_mutation,
+                        params,
+                    );
+                    match response {
+                        Ok(summary) => {
+                            self.send_response(new_response(x.id, Ok(summary)));
+                        }
+                        Err(e) => {
+                            self.send_response(Response::new_err(
+                                x.id,
+                                ErrorCode::InternalError as i32,
+                                format!("{e:#}"),
+                            ));
+                        }
+                    }
                     return Ok(ProcessEvent::Continue);
                 }
 
@@ -2660,6 +2698,308 @@ impl Server {
             .map(|(handle, _)| handle)
     }
 
+    /// Muffet extension: resolve many go-to-definition queries in one request.
+    ///
+    /// This method reads NDJSON from `request_path` and writes NDJSON to `response_path`, emitting
+    /// exactly one output line per input line.
+    ///
+    /// Invariants enforced:
+    /// - Version-gated correctness: if the server is not at `(uri, lspVersion)`, we return
+    ///   `stale=true` with empty defs instead of guessing.
+    /// - Bounded output: `maxTargetsPerSite` caps each site; `deadlineMs` bounds per-line work and
+    ///   returns partial results with `stats.truncated=true`.
+    fn muffet_semantic_snapshot_bulk<'a>(
+        &'a self,
+        ide_transaction_manager: &mut TransactionManager<'a>,
+        _telemetry: &impl Telemetry,
+        telemetry_event: &mut TelemetryEvent,
+        _subsequent_mutation: bool,
+        params: MuffetSemanticSnapshotBulkParams,
+    ) -> anyhow::Result<MuffetSemanticSnapshotBulkSummary> {
+        use std::io::BufRead;
+        use std::io::Write;
+
+        let started_at = Instant::now();
+
+        let request_path = PathBuf::from(params.request_path);
+        let response_path = PathBuf::from(params.response_path);
+        if let Some(parent) = response_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let max_targets_per_site = params
+            .options
+            .as_ref()
+            .and_then(|o| o.max_targets_per_site)
+            .map(|v| v as usize)
+            .unwrap_or(8);
+        let deadline_ms = params
+            .options
+            .as_ref()
+            .and_then(|o| o.deadline_ms)
+            .map(|v| v as u128);
+
+        let mut transaction = ide_transaction_manager.non_committable_transaction(&self.state);
+        self.validate_in_memory_for_transaction(&mut transaction, telemetry_event);
+
+        let request_file = std::fs::File::open(&request_path)?;
+        let request_reader = std::io::BufReader::new(request_file);
+        let response_file = std::fs::File::create(&response_path)?;
+        let mut response_writer = std::io::BufWriter::new(response_file);
+
+        let mut handle_cache: HashMap<Url, (Handle, ModuleInfo)> = HashMap::new();
+        let mut summary = MuffetSemanticSnapshotBulkSummary::default();
+
+        for line in request_reader.lines() {
+            let line = match line {
+                Ok(v) => v,
+                Err(e) => {
+                    summary.errors += 1;
+                    tracing::error!("Failed reading muffet NDJSON line: {e}");
+                    continue;
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            summary.lines += 1;
+
+            let parsed = match serde_json::from_str::<MuffetSemanticSnapshotBulkLine>(&line) {
+                Ok(v) => v,
+                Err(e) => {
+                    summary.errors += 1;
+                    let (request_id, uri) = best_effort_extract_request_id_and_uri(&line);
+                    write_bulk_error_line(
+                        &mut response_writer,
+                        request_id,
+                        uri,
+                        format!("Failed to parse request line: {e}"),
+                    )?;
+                    continue;
+                }
+            };
+            let _ = (&parsed.project_root_path, &parsed.text);
+
+            let uri = match Url::parse(&parsed.uri) {
+                Ok(v) => v,
+                Err(e) => {
+                    summary.errors += 1;
+                    write_bulk_error_line(
+                        &mut response_writer,
+                        parsed.request_id,
+                        parsed.uri,
+                        format!("Invalid uri: {e}"),
+                    )?;
+                    continue;
+                }
+            };
+
+            let (result, was_stale, line_error) = self.muffet_semantic_snapshot_for_line(
+                &mut transaction,
+                &mut handle_cache,
+                &uri,
+                parsed.lsp_version,
+                &parsed.call_sites,
+                &parsed.ref_sites,
+                max_targets_per_site,
+                deadline_ms,
+            );
+
+            match (result, line_error) {
+                (Some(result), None) => {
+                    if was_stale {
+                        summary.stale_lines += 1;
+                    }
+                    if result.stats.truncated {
+                        summary.truncated_lines += 1;
+                    }
+                    summary.total_ms += result.stats.total_ms as u64;
+                    write_bulk_result_line(
+                        &mut response_writer,
+                        parsed.request_id,
+                        parsed.uri,
+                        result,
+                    )?;
+                }
+                (_, Some(err)) => {
+                    summary.errors += 1;
+                    write_bulk_error_line(
+                        &mut response_writer,
+                        parsed.request_id,
+                        parsed.uri,
+                        err,
+                    )?;
+                }
+                (None, None) => {
+                    summary.errors += 1;
+                    write_bulk_error_line(
+                        &mut response_writer,
+                        parsed.request_id,
+                        parsed.uri,
+                        "Internal error: missing result".to_owned(),
+                    )?;
+                }
+            }
+        }
+
+        response_writer.flush()?;
+        summary.wall_ms = started_at.elapsed().as_millis() as u64;
+        Ok(summary)
+    }
+
+    fn muffet_semantic_snapshot_for_line<'a>(
+        &'a self,
+        transaction: &mut Transaction<'a>,
+        handle_cache: &mut HashMap<Url, (Handle, ModuleInfo)>,
+        uri: &Url,
+        requested_version: i32,
+        call_sites: &[MuffetSemanticSnapshotCallSite],
+        ref_sites: &[MuffetSemanticSnapshotRefSite],
+        max_targets_per_site: usize,
+        deadline_ms: Option<u128>,
+    ) -> (Option<MuffetSemanticSnapshotResult>, bool, Option<String>) {
+        let Some(path) = self.path_for_uri(uri) else {
+            return (
+                None,
+                false,
+                Some("Could not convert uri to file path".to_owned()),
+            );
+        };
+
+        let current_version = self.version_info.lock().get(&path).copied();
+        if current_version != Some(requested_version) {
+            let result = MuffetSemanticSnapshotResult::stale(
+                format!("lsp-{}", current_version.unwrap_or(-1)),
+                call_sites,
+                ref_sites,
+            );
+            return (Some(result), true, None);
+        }
+
+        if !handle_cache.contains_key(uri) {
+            let Some(handle) = self.make_handle_if_enabled(uri, None) else {
+                return (
+                    None,
+                    false,
+                    Some("Language services disabled for workspace".to_owned()),
+                );
+            };
+            let Some(info) = transaction.get_module_info(&handle) else {
+                return (
+                    None,
+                    false,
+                    Some("Module info unavailable (file not indexed)".to_owned()),
+                );
+            };
+            handle_cache.insert(uri.clone(), (handle, info));
+        }
+        let Some((handle, info)) = handle_cache.get(uri) else {
+            return (
+                None,
+                false,
+                Some("Internal error: handle cache missing entry".to_owned()),
+            );
+        };
+
+        let started_at = Instant::now();
+        let mut truncated = false;
+        let mut returned_defs: u32 = 0;
+
+        let mut defs_by_call_site = Vec::with_capacity(call_sites.len());
+        let mut defs_by_ref_site = Vec::with_capacity(ref_sites.len());
+
+        let mut resolve_ms: u128 = 0;
+
+        let mut resolve_site = |pos: Position| -> Vec<Location> {
+            let resolve_started_at = Instant::now();
+            let text_pos = self.from_lsp_position(uri, info, pos);
+            let targets = transaction.goto_definition(handle, text_pos);
+            let mut defs: Vec<Location> = Vec::new();
+            for target in targets.iter().filter_map(|x| self.to_lsp_location(x)) {
+                if defs.contains(&target) {
+                    continue;
+                }
+                defs.push(target);
+                if defs.len() >= max_targets_per_site {
+                    break;
+                }
+            }
+            resolve_ms += resolve_started_at.elapsed().as_millis();
+            returned_defs = returned_defs.saturating_add(defs.len() as u32);
+            defs
+        };
+
+        for site in call_sites {
+            if let Some(ms) = deadline_ms
+                && started_at.elapsed().as_millis() > ms
+            {
+                truncated = true;
+                break;
+            }
+            defs_by_call_site.push(MuffetSemanticSnapshotDefsAtSite {
+                line: site.line,
+                character: site.character,
+                defs: resolve_site(Position {
+                    line: site.line,
+                    character: site.character,
+                }),
+            });
+        }
+
+        for site in ref_sites {
+            let _ = (site.end_line, site.end_character);
+            if let Some(ms) = deadline_ms
+                && started_at.elapsed().as_millis() > ms
+            {
+                truncated = true;
+                break;
+            }
+            defs_by_ref_site.push(MuffetSemanticSnapshotDefsAtSite {
+                line: site.line,
+                character: site.character,
+                defs: resolve_site(Position {
+                    line: site.line,
+                    character: site.character,
+                }),
+            });
+        }
+
+        if defs_by_call_site.len() < call_sites.len() {
+            defs_by_call_site.extend(call_sites[defs_by_call_site.len()..].iter().map(|s| {
+                MuffetSemanticSnapshotDefsAtSite {
+                    line: s.line,
+                    character: s.character,
+                    defs: Vec::new(),
+                }
+            }));
+        }
+        if defs_by_ref_site.len() < ref_sites.len() {
+            defs_by_ref_site.extend(ref_sites[defs_by_ref_site.len()..].iter().map(|s| {
+                MuffetSemanticSnapshotDefsAtSite {
+                    line: s.line,
+                    character: s.character,
+                    defs: Vec::new(),
+                }
+            }));
+        }
+
+        let total_ms = started_at.elapsed().as_millis();
+        let result = MuffetSemanticSnapshotResult {
+            stale: false,
+            current_version: format!("lsp-{requested_version}"),
+            defs_by_call_site,
+            defs_by_ref_site,
+            stats: MuffetSemanticSnapshotStats {
+                total_ms: ms_to_u32(total_ms),
+                resolve_ms: ms_to_u32(resolve_ms),
+                returned_defs,
+                truncated,
+            },
+        };
+
+        (Some(result), false, None)
+    }
+
     fn goto_definition(
         &self,
         transaction: &Transaction<'_>,
@@ -4003,4 +4343,190 @@ impl TspInterface for Server {
     fn telemetry_state(&self) -> TelemetryServerState {
         self.telemetry_state()
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotBulkParams {
+    request_path: String,
+    response_path: String,
+    options: Option<MuffetSemanticSnapshotOptions>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotOptions {
+    max_targets_per_site: Option<u32>,
+    deadline_ms: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotBulkLine {
+    request_id: u64,
+    uri: String,
+    project_root_path: String,
+    lsp_version: i32,
+    /// Full file contents, represented as raw JSON to avoid allocating/unescaping.
+    ///
+    /// Muffet ensures the language server has already applied this text for `(uri, lspVersion)`
+    /// via `didOpen` / `didChange` before issuing the bulk request.
+    text: Box<serde_json::value::RawValue>,
+    call_sites: Vec<MuffetSemanticSnapshotCallSite>,
+    ref_sites: Vec<MuffetSemanticSnapshotRefSite>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotCallSite {
+    line: u32,
+    character: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotRefSite {
+    line: u32,
+    character: u32,
+    end_line: u32,
+    end_character: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotBulkResponseLine {
+    request_id: u64,
+    uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<MuffetSemanticSnapshotResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotResult {
+    stale: bool,
+    current_version: String,
+    defs_by_call_site: Vec<MuffetSemanticSnapshotDefsAtSite>,
+    defs_by_ref_site: Vec<MuffetSemanticSnapshotDefsAtSite>,
+    stats: MuffetSemanticSnapshotStats,
+}
+
+impl MuffetSemanticSnapshotResult {
+    fn stale(
+        current_version: String,
+        call_sites: &[MuffetSemanticSnapshotCallSite],
+        ref_sites: &[MuffetSemanticSnapshotRefSite],
+    ) -> Self {
+        Self {
+            stale: true,
+            current_version,
+            defs_by_call_site: call_sites
+                .iter()
+                .map(|s| MuffetSemanticSnapshotDefsAtSite {
+                    line: s.line,
+                    character: s.character,
+                    defs: Vec::new(),
+                })
+                .collect(),
+            defs_by_ref_site: ref_sites
+                .iter()
+                .map(|s| MuffetSemanticSnapshotDefsAtSite {
+                    line: s.line,
+                    character: s.character,
+                    defs: Vec::new(),
+                })
+                .collect(),
+            stats: MuffetSemanticSnapshotStats {
+                total_ms: 0,
+                resolve_ms: 0,
+                returned_defs: 0,
+                truncated: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotDefsAtSite {
+    line: u32,
+    character: u32,
+    defs: Vec<Location>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotStats {
+    total_ms: u32,
+    resolve_ms: u32,
+    returned_defs: u32,
+    truncated: bool,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotBulkSummary {
+    lines: u64,
+    errors: u64,
+    stale_lines: u64,
+    truncated_lines: u64,
+    /// Sum of per-line `stats.totalMs` (not wall clock).
+    total_ms: u64,
+    /// Wall clock for the whole bulk request handler.
+    wall_ms: u64,
+}
+
+fn ms_to_u32(ms: u128) -> u32 {
+    ms.min(u32::MAX as u128) as u32
+}
+
+fn best_effort_extract_request_id_and_uri(line: &str) -> (u64, String) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return (0, String::new());
+    };
+    let request_id = v.get("requestId").and_then(|v| v.as_u64()).unwrap_or(0);
+    let uri = v
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    (request_id, uri)
+}
+
+fn write_bulk_result_line(
+    w: &mut std::io::BufWriter<std::fs::File>,
+    request_id: u64,
+    uri: String,
+    result: MuffetSemanticSnapshotResult,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let line = MuffetSemanticSnapshotBulkResponseLine {
+        request_id,
+        uri,
+        result: Some(result),
+        error: None,
+    };
+    serde_json::to_writer(&mut *w, &line)?;
+    w.write_all(b"\n")?;
+    Ok(())
+}
+
+fn write_bulk_error_line(
+    w: &mut std::io::BufWriter<std::fs::File>,
+    request_id: u64,
+    uri: String,
+    error: String,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let line = MuffetSemanticSnapshotBulkResponseLine {
+        request_id,
+        uri,
+        result: None,
+        error: Some(error),
+    };
+    serde_json::to_writer(&mut *w, &line)?;
+    w.write_all(b"\n")?;
+    Ok(())
 }
