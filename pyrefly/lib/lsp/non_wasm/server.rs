@@ -1157,8 +1157,8 @@ impl Server {
                         params,
                     );
                     match response {
-                        Ok(summary) => {
-                            self.send_response(new_response(x.id, Ok(summary)));
+                        Ok(result) => {
+                            self.send_response(new_response(x.id, Ok(result)));
                         }
                         Err(e) => {
                             self.send_response(Response::new_err(
@@ -2700,12 +2700,15 @@ impl Server {
 
     /// Muffet extension: resolve many go-to-definition queries in one request.
     ///
-    /// This method reads NDJSON from `request_path` and writes NDJSON to `response_path`, emitting
-    /// exactly one output line per input line.
+    /// This method receives inline request `lines` and returns one response object per line.
     ///
     /// Invariants enforced:
-    /// - Version-gated correctness: if the server is not at `(uri, lspVersion)`, we return
-    ///   `stale=true` with empty defs instead of guessing.
+    /// - Version-gated correctness: if `lspVersion` is older than the applied version for a file,
+    ///   we return `stale=true` with empty defs instead of guessing.
+    /// - Content authority correctness:
+    ///   - `contentSource=text` requires `text` when apply is needed.
+    ///   - `contentSource=disk` requires `expectedSha256Hex` when apply is needed, and the file's
+    ///     SHA-256 must match exactly.
     /// - Bounded output: `maxTargetsPerSite` caps each site; `deadlineMs` bounds per-line work and
     ///   returns partial results with `stats.truncated=true`.
     fn muffet_semantic_snapshot_bulk<'a>(
@@ -2715,18 +2718,7 @@ impl Server {
         telemetry_event: &mut TelemetryEvent,
         _subsequent_mutation: bool,
         params: MuffetSemanticSnapshotBulkParams,
-    ) -> anyhow::Result<MuffetSemanticSnapshotBulkSummary> {
-        use std::io::BufRead;
-        use std::io::Write;
-
-        let started_at = Instant::now();
-
-        let request_path = PathBuf::from(params.request_path);
-        let response_path = PathBuf::from(params.response_path);
-        if let Some(parent) = response_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
+    ) -> anyhow::Result<MuffetSemanticSnapshotBulkResult> {
         let max_targets_per_site = params
             .options
             .as_ref()
@@ -2739,112 +2731,165 @@ impl Server {
             .and_then(|o| o.deadline_ms)
             .map(|v| v as u128);
 
+        enum BulkLineAction {
+            Ready(MuffetSemanticSnapshotBulkResponseLine),
+            Resolve {
+                line: MuffetSemanticSnapshotBulkLine,
+                uri: Url,
+            },
+        }
+
+        let mut actions: Vec<BulkLineAction> = Vec::with_capacity(params.lines.len());
+        let mut pending_open_file_updates: HashMap<PathBuf, Arc<LspFile>> = HashMap::new();
+        let mut pending_version_updates: HashMap<PathBuf, i32> = HashMap::new();
+
+        let mut current_versions = self.version_info.lock().clone();
+        let mut active_files: HashSet<PathBuf> = self.open_files.read().keys().cloned().collect();
+
+        for line in params.lines {
+            let uri = match Url::parse(&line.uri) {
+                Ok(v) => v,
+                Err(e) => {
+                    actions.push(BulkLineAction::Ready(bulk_error_response(
+                        line.request_id,
+                        line.uri,
+                        format!("Invalid uri: {e}"),
+                    )));
+                    continue;
+                }
+            };
+
+            let file_path = match strict_file_path_for_uri(&uri) {
+                Ok(path) => path,
+                Err(err) => {
+                    actions.push(BulkLineAction::Ready(bulk_error_response(
+                        line.request_id,
+                        line.uri,
+                        err,
+                    )));
+                    continue;
+                }
+            };
+
+            if let Err(err) = ensure_under_project_root(&line.project_root_path, &file_path) {
+                actions.push(BulkLineAction::Ready(bulk_error_response(
+                    line.request_id,
+                    line.uri,
+                    err,
+                )));
+                continue;
+            }
+
+            let previous_version = current_versions.get(&file_path).copied().unwrap_or(0);
+            if line.lsp_version > 0 && line.lsp_version < previous_version {
+                actions.push(BulkLineAction::Ready(bulk_result_response(
+                    line.request_id,
+                    line.uri,
+                    MuffetSemanticSnapshotResult::stale(
+                        format!("lsp-{}", previous_version),
+                        &line.call_sites,
+                        &line.ref_sites,
+                    ),
+                )));
+                continue;
+            }
+
+            let already_applied = line.lsp_version > 0 && line.lsp_version == previous_version;
+            let has_active_file_state = active_files.contains(&file_path);
+            let need_apply = !already_applied || !has_active_file_state;
+
+            if need_apply {
+                let text = match bulk_line_text_to_apply(&line, &file_path) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        actions.push(BulkLineAction::Ready(bulk_error_response(
+                            line.request_id,
+                            line.uri,
+                            err,
+                        )));
+                        continue;
+                    }
+                };
+                pending_open_file_updates
+                    .insert(file_path.clone(), Arc::new(LspFile::from_source(text)));
+                if line.lsp_version > 0 {
+                    current_versions.insert(file_path.clone(), line.lsp_version);
+                    pending_version_updates.insert(file_path.clone(), line.lsp_version);
+                }
+                active_files.insert(file_path.clone());
+            }
+
+            if line.call_sites.is_empty() && line.ref_sites.is_empty() {
+                actions.push(BulkLineAction::Ready(bulk_result_response(
+                    line.request_id,
+                    line.uri,
+                    MuffetSemanticSnapshotResult::empty(
+                        format!("lsp-{}", line.lsp_version),
+                        false,
+                        &line.call_sites,
+                        &line.ref_sites,
+                    ),
+                )));
+                continue;
+            }
+
+            actions.push(BulkLineAction::Resolve { line, uri });
+        }
+
+        if !pending_version_updates.is_empty() {
+            let mut version_info = self.version_info.lock();
+            for (path, version) in pending_version_updates {
+                version_info.insert(path, version);
+            }
+        }
+        if !pending_open_file_updates.is_empty() {
+            let mut open_files = self.open_files.write();
+            for (path, file) in pending_open_file_updates {
+                open_files.insert(path, file);
+            }
+        }
+
         let mut transaction = ide_transaction_manager.non_committable_transaction(&self.state);
         self.validate_in_memory_for_transaction(&mut transaction, telemetry_event);
 
-        let request_file = std::fs::File::open(&request_path)?;
-        let request_reader = std::io::BufReader::new(request_file);
-        let response_file = std::fs::File::create(&response_path)?;
-        let mut response_writer = std::io::BufWriter::new(response_file);
-
+        let mut responses: Vec<MuffetSemanticSnapshotBulkResponseLine> =
+            Vec::with_capacity(actions.len());
         let mut handle_cache: HashMap<Url, (Handle, ModuleInfo)> = HashMap::new();
-        let mut summary = MuffetSemanticSnapshotBulkSummary::default();
+        for action in actions {
+            match action {
+                BulkLineAction::Ready(line) => responses.push(line),
+                BulkLineAction::Resolve { line, uri } => {
+                    let (result, _was_stale, line_error) = self.muffet_semantic_snapshot_for_line(
+                        &mut transaction,
+                        &mut handle_cache,
+                        &uri,
+                        line.lsp_version,
+                        &line.call_sites,
+                        &line.ref_sites,
+                        max_targets_per_site,
+                        deadline_ms,
+                    );
 
-        for line in request_reader.lines() {
-            let line = match line {
-                Ok(v) => v,
-                Err(e) => {
-                    summary.errors += 1;
-                    tracing::error!("Failed reading muffet NDJSON line: {e}");
-                    continue;
-                }
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            summary.lines += 1;
-
-            let parsed = match serde_json::from_str::<MuffetSemanticSnapshotBulkLine>(&line) {
-                Ok(v) => v,
-                Err(e) => {
-                    summary.errors += 1;
-                    let (request_id, uri) = best_effort_extract_request_id_and_uri(&line);
-                    write_bulk_error_line(
-                        &mut response_writer,
-                        request_id,
-                        uri,
-                        format!("Failed to parse request line: {e}"),
-                    )?;
-                    continue;
-                }
-            };
-            let _ = (&parsed.project_root_path, &parsed.text);
-
-            let uri = match Url::parse(&parsed.uri) {
-                Ok(v) => v,
-                Err(e) => {
-                    summary.errors += 1;
-                    write_bulk_error_line(
-                        &mut response_writer,
-                        parsed.request_id,
-                        parsed.uri,
-                        format!("Invalid uri: {e}"),
-                    )?;
-                    continue;
-                }
-            };
-
-            let (result, was_stale, line_error) = self.muffet_semantic_snapshot_for_line(
-                &mut transaction,
-                &mut handle_cache,
-                &uri,
-                parsed.lsp_version,
-                &parsed.call_sites,
-                &parsed.ref_sites,
-                max_targets_per_site,
-                deadline_ms,
-            );
-
-            match (result, line_error) {
-                (Some(result), None) => {
-                    if was_stale {
-                        summary.stale_lines += 1;
+                    match (result, line_error) {
+                        (Some(result), None) => {
+                            responses.push(bulk_result_response(line.request_id, line.uri, result));
+                        }
+                        (_, Some(err)) => {
+                            responses.push(bulk_error_response(line.request_id, line.uri, err));
+                        }
+                        (None, None) => {
+                            responses.push(bulk_error_response(
+                                line.request_id,
+                                line.uri,
+                                "Internal error: missing result".to_owned(),
+                            ));
+                        }
                     }
-                    if result.stats.truncated {
-                        summary.truncated_lines += 1;
-                    }
-                    summary.total_ms += result.stats.total_ms as u64;
-                    write_bulk_result_line(
-                        &mut response_writer,
-                        parsed.request_id,
-                        parsed.uri,
-                        result,
-                    )?;
-                }
-                (_, Some(err)) => {
-                    summary.errors += 1;
-                    write_bulk_error_line(
-                        &mut response_writer,
-                        parsed.request_id,
-                        parsed.uri,
-                        err,
-                    )?;
-                }
-                (None, None) => {
-                    summary.errors += 1;
-                    write_bulk_error_line(
-                        &mut response_writer,
-                        parsed.request_id,
-                        parsed.uri,
-                        "Internal error: missing result".to_owned(),
-                    )?;
                 }
             }
         }
 
-        response_writer.flush()?;
-        summary.wall_ms = started_at.elapsed().as_millis() as u64;
-        Ok(summary)
+        Ok(MuffetSemanticSnapshotBulkResult { responses })
     }
 
     fn muffet_semantic_snapshot_for_line<'a>(
@@ -2914,16 +2959,13 @@ impl Server {
             let resolve_started_at = Instant::now();
             let text_pos = self.from_lsp_position(uri, info, pos);
             let targets = transaction.goto_definition(handle, text_pos);
-            let mut defs: Vec<Location> = Vec::new();
-            for target in targets.iter().filter_map(|x| self.to_lsp_location(x)) {
-                if defs.contains(&target) {
-                    continue;
-                }
-                defs.push(target);
-                if defs.len() >= max_targets_per_site {
-                    break;
-                }
-            }
+            let defs = normalize_locations(
+                max_targets_per_site,
+                targets
+                    .iter()
+                    .filter_map(|x| self.to_lsp_location(x))
+                    .collect(),
+            );
             resolve_ms += resolve_started_at.elapsed().as_millis();
             returned_defs = returned_defs.saturating_add(defs.len() as u32);
             defs
@@ -4346,50 +4388,60 @@ impl TspInterface for Server {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MuffetSemanticSnapshotBulkParams {
-    request_path: String,
-    response_path: String,
+    lines: Vec<MuffetSemanticSnapshotBulkLine>,
     options: Option<MuffetSemanticSnapshotOptions>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MuffetSemanticSnapshotOptions {
     max_targets_per_site: Option<u32>,
     deadline_ms: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
+enum MuffetSemanticSnapshotContentSource {
+    Text,
+    Disk,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MuffetSemanticSnapshotBulkLine {
     request_id: u64,
     uri: String,
     project_root_path: String,
     lsp_version: i32,
-    /// Full file contents, represented as raw JSON to avoid allocating/unescaping.
-    ///
-    /// Muffet ensures the language server has already applied this text for `(uri, lspVersion)`
-    /// via `didOpen` / `didChange` before issuing the bulk request.
-    text: Box<serde_json::value::RawValue>,
+    content_source: MuffetSemanticSnapshotContentSource,
+    text: Option<String>,
+    expected_sha256_hex: Option<String>,
     call_sites: Vec<MuffetSemanticSnapshotCallSite>,
     ref_sites: Vec<MuffetSemanticSnapshotRefSite>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MuffetSemanticSnapshotCallSite {
     line: u32,
     character: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MuffetSemanticSnapshotRefSite {
     line: u32,
     character: u32,
     end_line: u32,
     end_character: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotBulkResult {
+    responses: Vec<MuffetSemanticSnapshotBulkResponseLine>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4414,13 +4466,14 @@ struct MuffetSemanticSnapshotResult {
 }
 
 impl MuffetSemanticSnapshotResult {
-    fn stale(
+    fn empty(
         current_version: String,
+        stale: bool,
         call_sites: &[MuffetSemanticSnapshotCallSite],
         ref_sites: &[MuffetSemanticSnapshotRefSite],
     ) -> Self {
         Self {
-            stale: true,
+            stale,
             current_version,
             defs_by_call_site: call_sites
                 .iter()
@@ -4446,6 +4499,14 @@ impl MuffetSemanticSnapshotResult {
             },
         }
     }
+
+    fn stale(
+        current_version: String,
+        call_sites: &[MuffetSemanticSnapshotCallSite],
+        ref_sites: &[MuffetSemanticSnapshotRefSite],
+    ) -> Self {
+        Self::empty(current_version, true, call_sites, ref_sites)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -4465,68 +4526,282 @@ struct MuffetSemanticSnapshotStats {
     truncated: bool,
 }
 
-#[derive(Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MuffetSemanticSnapshotBulkSummary {
-    lines: u64,
-    errors: u64,
-    stale_lines: u64,
-    truncated_lines: u64,
-    /// Sum of per-line `stats.totalMs` (not wall clock).
-    total_ms: u64,
-    /// Wall clock for the whole bulk request handler.
-    wall_ms: u64,
-}
-
 fn ms_to_u32(ms: u128) -> u32 {
     ms.min(u32::MAX as u128) as u32
 }
 
-fn best_effort_extract_request_id_and_uri(line: &str) -> (u64, String) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return (0, String::new());
-    };
-    let request_id = v.get("requestId").and_then(|v| v.as_u64()).unwrap_or(0);
-    let uri = v
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-    (request_id, uri)
-}
-
-fn write_bulk_result_line(
-    w: &mut std::io::BufWriter<std::fs::File>,
+fn bulk_result_response(
     request_id: u64,
     uri: String,
     result: MuffetSemanticSnapshotResult,
-) -> anyhow::Result<()> {
-    use std::io::Write;
-    let line = MuffetSemanticSnapshotBulkResponseLine {
+) -> MuffetSemanticSnapshotBulkResponseLine {
+    MuffetSemanticSnapshotBulkResponseLine {
         request_id,
         uri,
         result: Some(result),
         error: None,
-    };
-    serde_json::to_writer(&mut *w, &line)?;
-    w.write_all(b"\n")?;
-    Ok(())
+    }
 }
 
-fn write_bulk_error_line(
-    w: &mut std::io::BufWriter<std::fs::File>,
+fn bulk_error_response(
     request_id: u64,
     uri: String,
     error: String,
-) -> anyhow::Result<()> {
-    use std::io::Write;
-    let line = MuffetSemanticSnapshotBulkResponseLine {
+) -> MuffetSemanticSnapshotBulkResponseLine {
+    MuffetSemanticSnapshotBulkResponseLine {
         request_id,
         uri,
         result: None,
         error: Some(error),
-    };
-    serde_json::to_writer(&mut *w, &line)?;
-    w.write_all(b"\n")?;
+    }
+}
+
+fn strict_file_path_for_uri(uri: &Url) -> Result<PathBuf, String> {
+    uri.to_file_path()
+        .map_err(|_| format!("uri must use file scheme (uri='{uri}')"))
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute (path='{}')", path.display()));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(format!(
+                        "path traversal escapes root (path='{}')",
+                        path.display()
+                    ));
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn canonicalize_or_normalize_absolute(path: &Path) -> Result<PathBuf, String> {
+    match std::fs::canonicalize(path) {
+        Ok(p) => Ok(p),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => normalize_absolute_path(path),
+        Err(err) => Err(format!(
+            "failed to canonicalize '{}': {err}",
+            path.display()
+        )),
+    }
+}
+
+fn ensure_under_project_root(project_root_path: &str, file_path: &Path) -> Result<(), String> {
+    let project_root = canonicalize_or_normalize_absolute(Path::new(project_root_path))?;
+    let file_path = canonicalize_or_normalize_absolute(file_path)?;
+    if file_path.starts_with(&project_root) {
+        return Ok(());
+    }
+    Err(format!(
+        "uri path is not under projectRootPath (projectRootPath='{}', uriPath='{}')",
+        project_root.display(),
+        file_path.display()
+    ))
+}
+
+fn validate_expected_sha256_hex(expected: &str) -> Result<(), String> {
+    if expected.len() != 64 {
+        return Err("expectedSha256Hex must be a 64-character lowercase hex string".to_owned());
+    }
+    if expected
+        .bytes()
+        .any(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err("expectedSha256Hex must be lowercase hex".to_owned());
+    }
     Ok(())
+}
+
+fn sha256_hex_lowercase(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(bytes);
+    faster_hex::hex_string(&digest[..])
+}
+
+fn bulk_line_text_to_apply(
+    line: &MuffetSemanticSnapshotBulkLine,
+    file_path: &Path,
+) -> Result<String, String> {
+    match line.content_source {
+        MuffetSemanticSnapshotContentSource::Text => line
+            .text
+            .clone()
+            .ok_or_else(|| "contentSource=text requires text when apply is needed".to_owned()),
+        MuffetSemanticSnapshotContentSource::Disk => {
+            let expected = line.expected_sha256_hex.as_deref().ok_or_else(|| {
+                "contentSource=disk requires expectedSha256Hex when apply is needed".to_owned()
+            })?;
+            validate_expected_sha256_hex(expected)?;
+            let bytes = std::fs::read(file_path).map_err(|err| {
+                format!(
+                    "failed reading disk content '{}': {err}",
+                    file_path.display()
+                )
+            })?;
+            let actual = sha256_hex_lowercase(bytes.as_slice());
+            if actual != expected {
+                return Err(format!(
+                    "disk content hash mismatch for '{}': expected {}, got {}",
+                    file_path.display(),
+                    expected,
+                    actual
+                ));
+            }
+            String::from_utf8(bytes).map_err(|err| {
+                format!(
+                    "disk content for '{}' is not valid UTF-8: {err}",
+                    file_path.display()
+                )
+            })
+        }
+    }
+}
+
+fn normalize_locations(max_targets_per_site: usize, mut defs: Vec<Location>) -> Vec<Location> {
+    defs.retain(|loc| loc.uri.scheme() == "file");
+    defs.sort_by(|a, b| {
+        a.uri
+            .as_str()
+            .cmp(b.uri.as_str())
+            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
+            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+            .then_with(|| a.range.end.line.cmp(&b.range.end.line))
+            .then_with(|| a.range.end.character.cmp(&b.range.end.character))
+    });
+    defs.dedup_by(|a, b| {
+        a.uri == b.uri
+            && a.range.start.line == b.range.start.line
+            && a.range.start.character == b.range.start.character
+            && a.range.end.line == b.range.end.line
+            && a.range.end.character == b.range.end.character
+    });
+    if defs.len() > max_targets_per_site {
+        defs.truncate(max_targets_per_site);
+    }
+    defs
+}
+
+#[cfg(test)]
+mod muffet_semantic_snapshot_bulk_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn location(uri: &str, line: u32, character: u32) -> Location {
+        Location {
+            uri: Url::parse(uri).expect("valid uri"),
+            range: Range {
+                start: Position { line, character },
+                end: Position {
+                    line,
+                    character: character.saturating_add(1),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn bulk_params_accept_inline_lines_and_reject_legacy_paths() {
+        let inline = json!({
+            "lines": [
+                {
+                    "requestId": 1,
+                    "uri": "file:///tmp/a.py",
+                    "projectRootPath": "/tmp",
+                    "lspVersion": 1,
+                    "contentSource": "text",
+                    "text": "print(1)\n",
+                    "callSites": [],
+                    "refSites": []
+                }
+            ],
+            "options": { "maxTargetsPerSite": 8, "deadlineMs": 50 }
+        });
+        let parsed: MuffetSemanticSnapshotBulkParams = serde_json::from_value(inline).unwrap();
+        assert_eq!(parsed.lines.len(), 1);
+
+        let legacy = json!({
+            "requestPath": "/tmp/in.ndjson",
+            "responsePath": "/tmp/out.ndjson",
+            "options": { "maxTargetsPerSite": 8, "deadlineMs": 50 }
+        });
+        assert!(serde_json::from_value::<MuffetSemanticSnapshotBulkParams>(legacy).is_err());
+    }
+
+    #[test]
+    fn bulk_result_serializes_responses_array() {
+        let result = MuffetSemanticSnapshotBulkResult {
+            responses: vec![bulk_error_response(
+                7,
+                "file:///tmp/a.py".to_owned(),
+                "boom".to_owned(),
+            )],
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        let responses = value
+            .get("responses")
+            .and_then(|v| v.as_array())
+            .expect("responses array");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].get("requestId").and_then(|v| v.as_u64()),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn normalize_locations_is_deterministic_and_filters_non_file() {
+        let defs = vec![
+            location("file:///tmp/b.py", 3, 2),
+            location("file:///tmp/a.py", 1, 5),
+            location("file:///tmp/a.py", 1, 5),
+            location("untitled:///tmp/a.py", 1, 1),
+            location("file:///tmp/a.py", 0, 1),
+        ];
+        let normalized = normalize_locations(2, defs);
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].uri.as_str(), "file:///tmp/a.py");
+        assert_eq!(normalized[0].range.start.line, 0);
+        assert_eq!(normalized[1].uri.as_str(), "file:///tmp/a.py");
+        assert_eq!(normalized[1].range.start.line, 1);
+    }
+
+    #[test]
+    fn disk_content_authority_fails_closed_on_hash_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("x.py");
+        std::fs::write(&file_path, "print('ok')\n").unwrap();
+
+        let line = MuffetSemanticSnapshotBulkLine {
+            request_id: 1,
+            uri: Url::from_file_path(&file_path).unwrap().to_string(),
+            project_root_path: tmp.path().to_string_lossy().to_string(),
+            lsp_version: 1,
+            content_source: MuffetSemanticSnapshotContentSource::Disk,
+            text: None,
+            expected_sha256_hex: Some(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            ),
+            call_sites: Vec::new(),
+            ref_sites: Vec::new(),
+        };
+
+        let err = bulk_line_text_to_apply(&line, &file_path).unwrap_err();
+        assert!(err.contains("hash mismatch"), "unexpected error: {err}");
+    }
 }

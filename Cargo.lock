@@ -2068,6 +2068,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_repr",
+ "sha2",
  "starlark_map",
  "static_assertions",
  "tempfile",
