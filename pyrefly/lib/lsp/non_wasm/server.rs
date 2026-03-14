@@ -176,6 +176,7 @@ use pyrefly_build::SourceDatabase;
 use pyrefly_build::handle::Handle;
 use pyrefly_config::config::ConfigSource;
 use pyrefly_python::PYTHON_EXTENSIONS;
+use pyrefly_python::ast::Ast;
 use pyrefly_python::module::TextRangeWithModule;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_name::ModuleNameWithKind;
@@ -210,6 +211,7 @@ use starlark_map::small_set::SmallSet;
 use tracing::error;
 use tracing::info;
 use uuid::Uuid;
+use ruff_python_ast::AnyNodeRef;
 
 use crate::ModuleInfo;
 use crate::commands::lsp::IndexingMode;
@@ -2955,10 +2957,34 @@ impl Server {
 
         let mut resolve_ms: u128 = 0;
 
-        let mut resolve_site = |pos: Position| -> Vec<Location> {
+        let mut ast_cache: HashMap<ModulePath, Option<Arc<ruff_python_ast::ModModule>>> =
+            HashMap::new();
+
+        let mut resolve_site = |pos: Position| -> (Vec<Location>, Vec<MuffetSemanticSnapshotDefIdentity>) {
             let resolve_started_at = Instant::now();
             let text_pos = self.from_lsp_position(uri, info, pos);
             let targets = transaction.goto_definition(handle, text_pos);
+
+            let mut def_identities: Vec<MuffetSemanticSnapshotDefIdentity> = Vec::new();
+            for t in &targets {
+                let Some(qualname) =
+                    python_lexical_qualname_for_definition_target(transaction, &self.state, &mut ast_cache, t)
+                else {
+                    continue;
+                };
+                let module_name = t.module.name().to_string();
+                if module_name.trim().is_empty() {
+                    continue;
+                }
+                let fqn = format!("py:///{module_name}:{qualname}");
+                def_identities.push(MuffetSemanticSnapshotDefIdentity {
+                    fqn,
+                    moniker: None,
+                    package_name: None,
+                });
+            }
+            normalize_def_identities(max_targets_per_site, &mut def_identities);
+
             let defs = normalize_locations(
                 max_targets_per_site,
                 targets
@@ -2968,7 +2994,7 @@ impl Server {
             );
             resolve_ms += resolve_started_at.elapsed().as_millis();
             returned_defs = returned_defs.saturating_add(defs.len() as u32);
-            defs
+            (defs, def_identities)
         };
 
         for site in call_sites {
@@ -2978,13 +3004,15 @@ impl Server {
                 truncated = true;
                 break;
             }
+            let (defs, def_identities) = resolve_site(Position {
+                line: site.line,
+                character: site.character,
+            });
             defs_by_call_site.push(MuffetSemanticSnapshotDefsAtSite {
                 line: site.line,
                 character: site.character,
-                defs: resolve_site(Position {
-                    line: site.line,
-                    character: site.character,
-                }),
+                defs,
+                def_identities,
             });
         }
 
@@ -2996,13 +3024,15 @@ impl Server {
                 truncated = true;
                 break;
             }
+            let (defs, def_identities) = resolve_site(Position {
+                line: site.line,
+                character: site.character,
+            });
             defs_by_ref_site.push(MuffetSemanticSnapshotDefsAtSite {
                 line: site.line,
                 character: site.character,
-                defs: resolve_site(Position {
-                    line: site.line,
-                    character: site.character,
-                }),
+                defs,
+                def_identities,
             });
         }
 
@@ -3012,6 +3042,7 @@ impl Server {
                     line: s.line,
                     character: s.character,
                     defs: Vec::new(),
+                    def_identities: Vec::new(),
                 }
             }));
         }
@@ -3021,6 +3052,7 @@ impl Server {
                     line: s.line,
                     character: s.character,
                     defs: Vec::new(),
+                    def_identities: Vec::new(),
                 }
             }));
         }
@@ -4481,6 +4513,7 @@ impl MuffetSemanticSnapshotResult {
                     line: s.line,
                     character: s.character,
                     defs: Vec::new(),
+                    def_identities: Vec::new(),
                 })
                 .collect(),
             defs_by_ref_site: ref_sites
@@ -4489,6 +4522,7 @@ impl MuffetSemanticSnapshotResult {
                     line: s.line,
                     character: s.character,
                     defs: Vec::new(),
+                    def_identities: Vec::new(),
                 })
                 .collect(),
             stats: MuffetSemanticSnapshotStats {
@@ -4515,6 +4549,18 @@ struct MuffetSemanticSnapshotDefsAtSite {
     line: u32,
     character: u32,
     defs: Vec<Location>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    def_identities: Vec<MuffetSemanticSnapshotDefIdentity>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MuffetSemanticSnapshotDefIdentity {
+    fqn: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moniker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4696,6 +4742,74 @@ fn normalize_locations(max_targets_per_site: usize, mut defs: Vec<Location>) -> 
     defs
 }
 
+fn normalize_def_identities(
+    max_targets_per_site: usize,
+    defs: &mut Vec<MuffetSemanticSnapshotDefIdentity>,
+) {
+    defs.sort_by(|a, b| {
+        a.fqn
+            .cmp(&b.fqn)
+            .then_with(|| a.package_name.cmp(&b.package_name))
+            .then_with(|| a.moniker.cmp(&b.moniker))
+    });
+    defs.dedup_by(|a, b| {
+        a.fqn == b.fqn && a.package_name == b.package_name && a.moniker == b.moniker
+    });
+    if defs.len() > max_targets_per_site {
+        defs.truncate(max_targets_per_site);
+    }
+}
+
+fn python_lexical_qualname_for_definition_target<'a>(
+    transaction: &Transaction<'a>,
+    state: &crate::state::state::State,
+    ast_cache: &mut HashMap<ModulePath, Option<Arc<ruff_python_ast::ModModule>>>,
+    target: &TextRangeWithModule,
+) -> Option<String> {
+    let module_path = target.module.path().dupe();
+    let ast_opt = match ast_cache.entry(module_path.dupe()) {
+        Entry::Occupied(e) => e.get().clone(),
+        Entry::Vacant(v) => {
+            let h = handle_from_module_path(state, module_path);
+            let ast = transaction.get_ast(&h);
+            v.insert(ast.clone());
+            ast
+        }
+    };
+    let ast = ast_opt?;
+
+    python_lexical_qualname_from_ast_at(ast.as_ref(), target.range.start())
+}
+
+fn python_lexical_qualname_from_ast_at(
+    ast: &ruff_python_ast::ModModule,
+    start: TextSize,
+) -> Option<String> {
+    let covering_nodes = Ast::locate_node(ast, start);
+
+    let mut def_idx: Option<usize> = None;
+    for (i, node) in covering_nodes.iter().enumerate() {
+        if matches!(node, AnyNodeRef::StmtFunctionDef(_) | AnyNodeRef::StmtClassDef(_)) {
+            def_idx = Some(i);
+            break;
+        }
+    }
+    let def_idx = def_idx?;
+
+    let mut parts: Vec<String> = Vec::new();
+    for node in covering_nodes[def_idx..].iter().rev() {
+        match node {
+            AnyNodeRef::StmtClassDef(cls) => parts.push(cls.name.id.to_string()),
+            AnyNodeRef::StmtFunctionDef(fun) => parts.push(fun.name.id.to_string()),
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("."))
+}
+
 #[cfg(test)]
 mod muffet_semantic_snapshot_bulk_tests {
     use serde_json::json;
@@ -4779,6 +4893,78 @@ mod muffet_semantic_snapshot_bulk_tests {
         assert_eq!(normalized[0].range.start.line, 0);
         assert_eq!(normalized[1].uri.as_str(), "file:///tmp/a.py");
         assert_eq!(normalized[1].range.start.line, 1);
+    }
+
+    #[test]
+    fn normalize_def_identities_is_deterministic_dedup_and_truncates() {
+        let mut defs = vec![
+            MuffetSemanticSnapshotDefIdentity {
+                fqn: "py:///b:Foo.bar".to_owned(),
+                moniker: None,
+                package_name: None,
+            },
+            MuffetSemanticSnapshotDefIdentity {
+                fqn: "py:///a:Foo.bar".to_owned(),
+                moniker: Some("m2".to_owned()),
+                package_name: Some("pkg".to_owned()),
+            },
+            MuffetSemanticSnapshotDefIdentity {
+                fqn: "py:///a:Foo.bar".to_owned(),
+                moniker: Some("m2".to_owned()),
+                package_name: Some("pkg".to_owned()),
+            },
+            MuffetSemanticSnapshotDefIdentity {
+                fqn: "py:///a:Foo.bar".to_owned(),
+                moniker: Some("m1".to_owned()),
+                package_name: Some("pkg".to_owned()),
+            },
+        ];
+
+        normalize_def_identities(2, &mut defs);
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].fqn, "py:///a:Foo.bar");
+        assert_eq!(defs[0].moniker.as_deref(), Some("m1"));
+        assert_eq!(defs[1].fqn, "py:///a:Foo.bar");
+        assert_eq!(defs[1].moniker.as_deref(), Some("m2"));
+
+        let wrapped = MuffetSemanticSnapshotDefsAtSite {
+            line: 0,
+            character: 0,
+            defs: Vec::new(),
+            def_identities: defs,
+        };
+        let v = serde_json::to_value(&wrapped).unwrap();
+        assert!(v.get("defIdentities").is_some());
+    }
+
+    #[test]
+    fn python_lexical_qualname_from_ast_at_handles_nested_defs() {
+        use pyrefly_python::ast::Ast as PyAst;
+        use ruff_python_ast::PySourceType;
+
+        let src = r#"
+class Outer:
+    class Inner:
+        def method(self):
+            pass
+
+def top_level():
+    def nested():
+        pass
+"#;
+        let (ast, _, _) = PyAst::parse(src, PySourceType::Python);
+
+        let method_pos = src.find("method").unwrap() as u32;
+        let nested_pos = src.find("nested").unwrap() as u32;
+
+        assert_eq!(
+            python_lexical_qualname_from_ast_at(&ast, TextSize::from(method_pos)).as_deref(),
+            Some("Outer.Inner.method")
+        );
+        assert_eq!(
+            python_lexical_qualname_from_ast_at(&ast, TextSize::from(nested_pos)).as_deref(),
+            Some("top_level.nested")
+        );
     }
 
     #[test]
