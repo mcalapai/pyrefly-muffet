@@ -199,6 +199,7 @@ use pyrefly_util::telemetry::TelemetryFileStats;
 use pyrefly_util::telemetry::TelemetryServerState;
 use pyrefly_util::telemetry::TelemetryTaskId;
 use pyrefly_util::watch_pattern::WatchPattern;
+use ruff_python_ast::AnyNodeRef;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
@@ -211,7 +212,6 @@ use starlark_map::small_set::SmallSet;
 use tracing::error;
 use tracing::info;
 use uuid::Uuid;
-use ruff_python_ast::AnyNodeRef;
 
 use crate::ModuleInfo;
 use crate::commands::lsp::IndexingMode;
@@ -2865,6 +2865,7 @@ impl Server {
                         &mut transaction,
                         &mut handle_cache,
                         &uri,
+                        Path::new(&line.project_root_path),
                         line.lsp_version,
                         &line.call_sites,
                         &line.ref_sites,
@@ -2899,6 +2900,7 @@ impl Server {
         transaction: &mut Transaction<'a>,
         handle_cache: &mut HashMap<Url, (Handle, ModuleInfo)>,
         uri: &Url,
+        project_root_path: &Path,
         requested_version: i32,
         call_sites: &[MuffetSemanticSnapshotCallSite],
         ref_sites: &[MuffetSemanticSnapshotRefSite],
@@ -2960,42 +2962,51 @@ impl Server {
         let mut ast_cache: HashMap<ModulePath, Option<Arc<ruff_python_ast::ModModule>>> =
             HashMap::new();
 
-        let mut resolve_site = |pos: Position| -> (Vec<Location>, Vec<MuffetSemanticSnapshotDefIdentity>) {
-            let resolve_started_at = Instant::now();
-            let text_pos = self.from_lsp_position(uri, info, pos);
-            let targets = transaction.goto_definition(handle, text_pos);
+        let mut resolve_site =
+            |pos: Position| -> (Vec<Location>, Vec<MuffetSemanticSnapshotDefIdentity>) {
+                let resolve_started_at = Instant::now();
+                let text_pos = self.from_lsp_position(uri, info, pos);
+                let targets = transaction.goto_definition(handle, text_pos);
 
-            let mut def_identities: Vec<MuffetSemanticSnapshotDefIdentity> = Vec::new();
-            for t in &targets {
-                let Some(qualname) =
-                    python_lexical_qualname_for_definition_target(transaction, &self.state, &mut ast_cache, t)
-                else {
-                    continue;
-                };
-                let module_name = t.module.name().to_string();
-                if module_name.trim().is_empty() {
-                    continue;
+                let mut defs: Vec<Location> = Vec::new();
+                let mut def_identities: Vec<MuffetSemanticSnapshotDefIdentity> = Vec::new();
+                for t in &targets {
+                    let Some(qualname) = python_lexical_qualname_for_definition_target(
+                        transaction,
+                        &self.state,
+                        &mut ast_cache,
+                        t,
+                    ) else {
+                        continue;
+                    };
+                    let module_name = t.module.name().to_string();
+                    if module_name.trim().is_empty() {
+                        continue;
+                    }
+                    let fqn = format!("py:///{module_name}:{qualname}");
+                    let location = self.to_lsp_location(t);
+                    if let Some(ref location) = location {
+                        if location_is_within_project_root(project_root_path, location) {
+                            defs.push(location.clone());
+                            continue;
+                        }
+                    }
+                    def_identities.push(MuffetSemanticSnapshotDefIdentity {
+                        fqn,
+                        moniker: None,
+                        package_name: None,
+                        source_path: location.as_ref().and_then(|location| {
+                            external_source_path_for_location(project_root_path, location)
+                        }),
+                    });
                 }
-                let fqn = format!("py:///{module_name}:{qualname}");
-                def_identities.push(MuffetSemanticSnapshotDefIdentity {
-                    fqn,
-                    moniker: None,
-                    package_name: None,
-                });
-            }
-            normalize_def_identities(max_targets_per_site, &mut def_identities);
-
-            let defs = normalize_locations(
-                max_targets_per_site,
-                targets
-                    .iter()
-                    .filter_map(|x| self.to_lsp_location(x))
-                    .collect(),
-            );
-            resolve_ms += resolve_started_at.elapsed().as_millis();
-            returned_defs = returned_defs.saturating_add(defs.len() as u32);
-            (defs, def_identities)
-        };
+                normalize_def_identities(max_targets_per_site, &mut def_identities);
+                let defs = normalize_locations(max_targets_per_site, defs);
+                resolve_ms += resolve_started_at.elapsed().as_millis();
+                returned_defs =
+                    returned_defs.saturating_add(defs.len() as u32 + def_identities.len() as u32);
+                (defs, def_identities)
+            };
 
         for site in call_sites {
             if let Some(ms) = deadline_ms
@@ -4561,6 +4572,8 @@ struct MuffetSemanticSnapshotDefIdentity {
     moniker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     package_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4660,6 +4673,32 @@ fn ensure_under_project_root(project_root_path: &str, file_path: &Path) -> Resul
     ))
 }
 
+fn location_is_within_project_root(project_root_path: &Path, location: &Location) -> bool {
+    let Ok(file_path) = strict_file_path_for_uri(&location.uri) else {
+        return false;
+    };
+    let Ok(project_root) = canonicalize_or_normalize_absolute(project_root_path) else {
+        return false;
+    };
+    let Ok(normalized_file_path) = canonicalize_or_normalize_absolute(&file_path) else {
+        return false;
+    };
+    normalized_file_path.starts_with(project_root)
+}
+
+fn external_source_path_for_location(
+    project_root_path: &Path,
+    location: &Location,
+) -> Option<String> {
+    let file_path = strict_file_path_for_uri(&location.uri).ok()?;
+    let normalized_file_path = canonicalize_or_normalize_absolute(&file_path).ok()?;
+    let normalized_project_root = canonicalize_or_normalize_absolute(project_root_path).ok()?;
+    if normalized_file_path.starts_with(normalized_project_root) {
+        return None;
+    }
+    Some(normalized_file_path.to_string_lossy().to_string())
+}
+
 fn validate_expected_sha256_hex(expected: &str) -> Result<(), String> {
     if expected.len() != 64 {
         return Err("expectedSha256Hex must be a 64-character lowercase hex string".to_owned());
@@ -4751,9 +4790,13 @@ fn normalize_def_identities(
             .cmp(&b.fqn)
             .then_with(|| a.package_name.cmp(&b.package_name))
             .then_with(|| a.moniker.cmp(&b.moniker))
+            .then_with(|| a.source_path.cmp(&b.source_path))
     });
     defs.dedup_by(|a, b| {
-        a.fqn == b.fqn && a.package_name == b.package_name && a.moniker == b.moniker
+        a.fqn == b.fqn
+            && a.package_name == b.package_name
+            && a.moniker == b.moniker
+            && a.source_path == b.source_path
     });
     if defs.len() > max_targets_per_site {
         defs.truncate(max_targets_per_site);
@@ -4789,7 +4832,10 @@ fn python_lexical_qualname_from_ast_at(
 
     let mut def_idx: Option<usize> = None;
     for (i, node) in covering_nodes.iter().enumerate() {
-        if matches!(node, AnyNodeRef::StmtFunctionDef(_) | AnyNodeRef::StmtClassDef(_)) {
+        if matches!(
+            node,
+            AnyNodeRef::StmtFunctionDef(_) | AnyNodeRef::StmtClassDef(_)
+        ) {
             def_idx = Some(i);
             break;
         }
@@ -4902,21 +4948,25 @@ mod muffet_semantic_snapshot_bulk_tests {
                 fqn: "py:///b:Foo.bar".to_owned(),
                 moniker: None,
                 package_name: None,
+                source_path: None,
             },
             MuffetSemanticSnapshotDefIdentity {
                 fqn: "py:///a:Foo.bar".to_owned(),
                 moniker: Some("m2".to_owned()),
                 package_name: Some("pkg".to_owned()),
+                source_path: Some("/tmp/site-packages/pkg/a.py".to_owned()),
             },
             MuffetSemanticSnapshotDefIdentity {
                 fqn: "py:///a:Foo.bar".to_owned(),
                 moniker: Some("m2".to_owned()),
                 package_name: Some("pkg".to_owned()),
+                source_path: Some("/tmp/site-packages/pkg/a.py".to_owned()),
             },
             MuffetSemanticSnapshotDefIdentity {
                 fqn: "py:///a:Foo.bar".to_owned(),
                 moniker: Some("m1".to_owned()),
                 package_name: Some("pkg".to_owned()),
+                source_path: None,
             },
         ];
 
@@ -4935,6 +4985,13 @@ mod muffet_semantic_snapshot_bulk_tests {
         };
         let v = serde_json::to_value(&wrapped).unwrap();
         assert!(v.get("defIdentities").is_some());
+        let serialized = v
+            .get("defIdentities")
+            .and_then(|value| value.as_array())
+            .and_then(|value| value.get(1))
+            .and_then(|value| value.get("sourcePath"))
+            .and_then(|value| value.as_str());
+        assert_eq!(serialized, Some("/tmp/site-packages/pkg/a.py"));
     }
 
     #[test]
