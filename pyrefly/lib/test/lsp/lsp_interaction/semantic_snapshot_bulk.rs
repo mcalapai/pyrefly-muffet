@@ -98,6 +98,16 @@ struct DefsAtSite {
     defs: Vec<Location>,
 }
 
+fn defs_match_single_file_suffix(defs: &[Location], suffix: &str) -> bool {
+    defs.len() == 1
+        && defs[0]
+            .uri
+            .to_file_path()
+            .ok()
+            .map(|path| path.ends_with(suffix))
+            == Some(true)
+}
+
 fn offset_to_position(text: &str, offset: usize) -> (u32, u32) {
     let prefix = &text[..offset];
     let line = prefix.bytes().filter(|b| *b == b'\n').count() as u32;
@@ -328,10 +338,128 @@ fn semantic_snapshot_bulk_preserves_external_source_backed_locations() {
                 .unwrap()
                 .defs_by_ref_site[0]
                 .defs;
-            defs.len() == 1
-                && defs[0].uri.to_file_path().ok().map(|path| {
-                    path.ends_with("custom_interpreter/bin/site-packages/custom_module.py")
-                }) == Some(true)
+            defs_match_single_file_suffix(
+                defs,
+                "custom_interpreter/bin/site-packages/custom_module.py",
+            )
+        })
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn semantic_snapshot_bulk_resolves_external_member_and_decorator_targets_from_semantic_index() {
+    let root = get_test_files_root();
+    let workspace_root = root.path().join("custom_interpreter/src");
+    let interpreter_path = setup_dummy_interpreter(&root.path().join("custom_interpreter"));
+    let scope_uri = Url::from_file_path(&workspace_root).unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(workspace_root.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(Some(json!([{
+                "pythonPath": interpreter_path.to_str().unwrap()
+            }]))),
+            ..Default::default()
+        })
+        .unwrap();
+
+    interaction.client.did_open("main.py");
+    interaction.client.did_open("routers.py");
+    interaction.client.did_open("admin.py");
+
+    interaction
+        .client
+        .send_request::<SemanticSnapshotBulk>(
+            serde_json::to_value(bulk_params(bulk_line(
+                &workspace_root,
+                "main.py",
+                &[
+                    ("FastAPI", 1),
+                    ("include_router", 0),
+                    ("include_router", 1),
+                    ("get", 0),
+                ],
+                &[],
+            )))
+            .unwrap(),
+        )
+        .expect_response_with(|result| {
+            let defs_by_call_site = &result.responses[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .defs_by_call_site;
+            defs_match_single_file_suffix(
+                &defs_by_call_site[0].defs,
+                "custom_interpreter/bin/site-packages/fastapi/applications.py",
+            ) && defs_match_single_file_suffix(
+                &defs_by_call_site[1].defs,
+                "custom_interpreter/bin/site-packages/fastapi/applications.py",
+            ) && defs_match_single_file_suffix(
+                &defs_by_call_site[2].defs,
+                "custom_interpreter/bin/site-packages/fastapi/applications.py",
+            ) && defs_match_single_file_suffix(
+                &defs_by_call_site[3].defs,
+                "custom_interpreter/bin/site-packages/fastapi/applications.py",
+            )
+        })
+        .unwrap();
+
+    interaction
+        .client
+        .send_request::<SemanticSnapshotBulk>(
+            serde_json::to_value(bulk_params(bulk_line(
+                &workspace_root,
+                "routers.py",
+                &[("APIRouter", 1), ("get", 0)],
+                &[],
+            )))
+            .unwrap(),
+        )
+        .expect_response_with(|result| {
+            let defs_by_call_site = &result.responses[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .defs_by_call_site;
+            defs_match_single_file_suffix(
+                &defs_by_call_site[0].defs,
+                "custom_interpreter/bin/site-packages/fastapi/routing.py",
+            ) && defs_match_single_file_suffix(
+                &defs_by_call_site[1].defs,
+                "custom_interpreter/bin/site-packages/fastapi/routing.py",
+            )
+        })
+        .unwrap();
+
+    interaction
+        .client
+        .send_request::<SemanticSnapshotBulk>(
+            serde_json::to_value(bulk_params(bulk_line(
+                &workspace_root,
+                "admin.py",
+                &[("APIRouter", 1), ("post", 0)],
+                &[],
+            )))
+            .unwrap(),
+        )
+        .expect_response_with(|result| {
+            let defs_by_call_site = &result.responses[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .defs_by_call_site;
+            defs_match_single_file_suffix(
+                &defs_by_call_site[0].defs,
+                "custom_interpreter/bin/site-packages/fastapi/routing.py",
+            ) && defs_match_single_file_suffix(
+                &defs_by_call_site[1].defs,
+                "custom_interpreter/bin/site-packages/fastapi/routing.py",
+            )
         })
         .unwrap();
 

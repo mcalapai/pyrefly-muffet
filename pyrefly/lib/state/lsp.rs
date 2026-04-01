@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 
 use dupe::Dupe;
 use fuzzy_matcher::FuzzyMatcher;
@@ -492,6 +493,155 @@ pub struct FindDefinitionItem {
 }
 
 impl<'a> Transaction<'a> {
+    fn definition_target_key(target: &TextRangeWithModule) -> (ModulePath, TextSize, TextSize) {
+        (
+            target.module.path().dupe(),
+            target.range.start(),
+            target.range.end(),
+        )
+    }
+
+    fn sort_and_dedupe_definition_targets(
+        mut targets: Vec<TextRangeWithModule>,
+    ) -> Vec<TextRangeWithModule> {
+        targets.sort_by_key(Self::definition_target_key);
+        targets.dedup_by(|left, right| {
+            Self::definition_target_key(left) == Self::definition_target_key(right)
+        });
+        targets
+    }
+
+    fn attribute_reference_at_position(
+        &self,
+        handle: &Handle,
+        position: TextSize,
+    ) -> Option<(TextRange, TextRange)> {
+        let IdentifierWithContext {
+            identifier,
+            context,
+        } = self.identifier_at(handle, position)?;
+        match context {
+            IdentifierContext::Attribute { base_range, .. }
+                if identifier.range.contains_inclusive(position) =>
+            {
+                Some((identifier.range, base_range))
+            }
+            _ => None,
+        }
+    }
+
+    fn module_info_for_exact_module_path(&self, module_path: &ModulePath) -> Option<Module> {
+        self.handles()
+            .into_iter()
+            .filter(|candidate| candidate.path() == module_path)
+            .sorted_by_key(|candidate| (candidate.path().dupe(), candidate.module()))
+            .find_map(|candidate| self.get_module_info(&candidate))
+    }
+
+    fn receiver_binding_definition_targets_for_attribute_position(
+        &self,
+        handle: &Handle,
+        position: TextSize,
+    ) -> Vec<TextRangeWithModule> {
+        let Some((_, base_range)) = self.attribute_reference_at_position(handle, position) else {
+            return Vec::new();
+        };
+        self.goto_definition(handle, base_range.start())
+    }
+
+    pub fn external_attribute_definition_targets_for_reference_range(
+        &self,
+        handle: &Handle,
+        reference_range: TextRange,
+    ) -> Vec<TextRangeWithModule> {
+        let Some(index) = self
+            .get_solutions(handle)
+            .and_then(|solutions| solutions.get_index())
+        else {
+            return Vec::new();
+        };
+
+        let mut recorded_targets = Vec::new();
+        {
+            let index = index.lock();
+            for (module_path, def_and_ref_ranges) in &index.externally_defined_attribute_references
+            {
+                for (definition_range, candidate_reference_range) in def_and_ref_ranges {
+                    if *candidate_reference_range == reference_range {
+                        recorded_targets.push((module_path.dupe(), *definition_range));
+                    }
+                }
+            }
+        }
+
+        recorded_targets.sort_by_key(|(module_path, definition_range)| {
+            (
+                module_path.dupe(),
+                definition_range.start(),
+                definition_range.end(),
+            )
+        });
+        recorded_targets.dedup();
+
+        let mut resolved_targets = Vec::with_capacity(recorded_targets.len());
+        for (module_path, definition_range) in recorded_targets {
+            let Some(module) = self.module_info_for_exact_module_path(&module_path) else {
+                continue;
+            };
+            resolved_targets.push(TextRangeWithModule::new(module, definition_range));
+        }
+
+        Self::sort_and_dedupe_definition_targets(resolved_targets)
+    }
+
+    pub fn external_attribute_definition_targets_for_position(
+        &self,
+        handle: &Handle,
+        position: TextSize,
+    ) -> Vec<TextRangeWithModule> {
+        let Some((reference_range, _)) = self.attribute_reference_at_position(handle, position)
+        else {
+            return Vec::new();
+        };
+        self.external_attribute_definition_targets_for_reference_range(handle, reference_range)
+    }
+
+    pub fn goto_definition_for_bulk(
+        &self,
+        handle: &Handle,
+        position: TextSize,
+    ) -> Vec<TextRangeWithModule> {
+        let semantic_targets =
+            self.external_attribute_definition_targets_for_position(handle, position);
+        if semantic_targets.is_empty() {
+            return self.goto_definition(handle, position);
+        }
+
+        let receiver_binding_keys = self
+            .receiver_binding_definition_targets_for_attribute_position(handle, position)
+            .into_iter()
+            .map(|target| Self::definition_target_key(&target))
+            .collect::<BTreeSet<_>>();
+
+        let mut merged_targets = Self::sort_and_dedupe_definition_targets(semantic_targets);
+        let mut seen = merged_targets
+            .iter()
+            .map(Self::definition_target_key)
+            .collect::<BTreeSet<_>>();
+
+        let goto_targets =
+            Self::sort_and_dedupe_definition_targets(self.goto_definition(handle, position));
+        for target in goto_targets {
+            let key = Self::definition_target_key(&target);
+            if receiver_binding_keys.contains(&key) || !seen.insert(key) {
+                continue;
+            }
+            merged_targets.push(target);
+        }
+
+        merged_targets
+    }
+
     pub fn get_type(&self, handle: &Handle, key: &Key) -> Option<Type> {
         let idx = self.get_bindings(handle)?.key_to_idx(key);
         let answers = self.get_answers(handle)?;

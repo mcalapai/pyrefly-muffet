@@ -2962,52 +2962,6 @@ impl Server {
         let mut ast_cache: HashMap<ModulePath, Option<Arc<ruff_python_ast::ModModule>>> =
             HashMap::new();
 
-        let mut resolve_site =
-            |pos: Position| -> (Vec<Location>, Vec<MuffetSemanticSnapshotDefIdentity>) {
-                let resolve_started_at = Instant::now();
-                let text_pos = self.from_lsp_position(uri, info, pos);
-                let targets = transaction.goto_definition(handle, text_pos);
-
-                let mut defs: Vec<Location> = Vec::new();
-                let mut def_identities: Vec<MuffetSemanticSnapshotDefIdentity> = Vec::new();
-                for t in &targets {
-                    let location = self.to_lsp_location(t);
-                    if let Some(ref location) = location {
-                        defs.push(location.clone());
-                        if location_is_within_project_root(project_root_path, location) {
-                            continue;
-                        }
-                    }
-                    let Some(qualname) = python_lexical_qualname_for_definition_target(
-                        transaction,
-                        &self.state,
-                        &mut ast_cache,
-                        t,
-                    ) else {
-                        continue;
-                    };
-                    let module_name = t.module.name().to_string();
-                    if module_name.trim().is_empty() {
-                        continue;
-                    }
-                    let fqn = format!("py:///{module_name}:{qualname}");
-                    def_identities.push(MuffetSemanticSnapshotDefIdentity {
-                        fqn,
-                        moniker: None,
-                        package_name: None,
-                        source_path: location.as_ref().and_then(|location| {
-                            external_source_path_for_location(project_root_path, location)
-                        }),
-                    });
-                }
-                normalize_def_identities(max_targets_per_site, &mut def_identities);
-                let defs = normalize_locations(max_targets_per_site, defs);
-                resolve_ms += resolve_started_at.elapsed().as_millis();
-                returned_defs =
-                    returned_defs.saturating_add(defs.len() as u32 + def_identities.len() as u32);
-                (defs, def_identities)
-            };
-
         for site in call_sites {
             if let Some(ms) = deadline_ms
                 && started_at.elapsed().as_millis() > ms
@@ -3015,10 +2969,26 @@ impl Server {
                 truncated = true;
                 break;
             }
-            let (defs, def_identities) = resolve_site(Position {
-                line: site.line,
-                character: site.character,
-            });
+            let resolve_started_at = Instant::now();
+            let text_pos = self.from_lsp_position(
+                uri,
+                info,
+                Position {
+                    line: site.line,
+                    character: site.character,
+                },
+            );
+            let targets = transaction.goto_definition_for_bulk(handle, text_pos);
+            resolve_ms += resolve_started_at.elapsed().as_millis();
+            let (defs, def_identities) = resolve_snapshot_targets(
+                self,
+                transaction,
+                targets.as_slice(),
+                project_root_path,
+                max_targets_per_site,
+                &mut ast_cache,
+                &mut returned_defs,
+            );
             defs_by_call_site.push(MuffetSemanticSnapshotDefsAtSite {
                 line: site.line,
                 character: site.character,
@@ -3035,10 +3005,26 @@ impl Server {
                 truncated = true;
                 break;
             }
-            let (defs, def_identities) = resolve_site(Position {
-                line: site.line,
-                character: site.character,
-            });
+            let resolve_started_at = Instant::now();
+            let text_pos = self.from_lsp_position(
+                uri,
+                info,
+                Position {
+                    line: site.line,
+                    character: site.character,
+                },
+            );
+            let targets = transaction.goto_definition(handle, text_pos);
+            resolve_ms += resolve_started_at.elapsed().as_millis();
+            let (defs, def_identities) = resolve_snapshot_targets(
+                self,
+                transaction,
+                targets.as_slice(),
+                project_root_path,
+                max_targets_per_site,
+                &mut ast_cache,
+                &mut returned_defs,
+            );
             defs_by_ref_site.push(MuffetSemanticSnapshotDefsAtSite {
                 line: site.line,
                 character: site.character,
@@ -4755,6 +4741,53 @@ fn bulk_line_text_to_apply(
             })
         }
     }
+}
+
+fn resolve_snapshot_targets<'a>(
+    server: &Server,
+    transaction: &Transaction<'a>,
+    targets: &[TextRangeWithModule],
+    project_root_path: &Path,
+    max_targets_per_site: usize,
+    ast_cache: &mut HashMap<ModulePath, Option<Arc<ruff_python_ast::ModModule>>>,
+    returned_defs: &mut u32,
+) -> (Vec<Location>, Vec<MuffetSemanticSnapshotDefIdentity>) {
+    let mut defs: Vec<Location> = Vec::new();
+    let mut def_identities: Vec<MuffetSemanticSnapshotDefIdentity> = Vec::new();
+    for target in targets {
+        let location = server.to_lsp_location(target);
+        if let Some(ref location) = location {
+            defs.push(location.clone());
+            if location_is_within_project_root(project_root_path, location) {
+                continue;
+            }
+        }
+        let Some(qualname) = python_lexical_qualname_for_definition_target(
+            transaction,
+            &server.state,
+            ast_cache,
+            target,
+        ) else {
+            continue;
+        };
+        let module_name = target.module.name().to_string();
+        if module_name.trim().is_empty() {
+            continue;
+        }
+        let fqn = format!("py:///{module_name}:{qualname}");
+        def_identities.push(MuffetSemanticSnapshotDefIdentity {
+            fqn,
+            moniker: None,
+            package_name: None,
+            source_path: location.as_ref().and_then(|location| {
+                external_source_path_for_location(project_root_path, location)
+            }),
+        });
+    }
+    normalize_def_identities(max_targets_per_site, &mut def_identities);
+    let defs = normalize_locations(max_targets_per_site, defs);
+    *returned_defs = returned_defs.saturating_add(defs.len() as u32 + def_identities.len() as u32);
+    (defs, def_identities)
 }
 
 fn normalize_locations(max_targets_per_site: usize, mut defs: Vec<Location>) -> Vec<Location> {
