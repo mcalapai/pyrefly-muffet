@@ -33,6 +33,7 @@ mod object_model;
 mod provide_type;
 mod references;
 mod rename;
+mod semantic_snapshot_bulk;
 mod semantic_tokens;
 mod type_definition;
 mod unsaved_file;

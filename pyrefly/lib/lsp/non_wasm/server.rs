@@ -2971,6 +2971,13 @@ impl Server {
                 let mut defs: Vec<Location> = Vec::new();
                 let mut def_identities: Vec<MuffetSemanticSnapshotDefIdentity> = Vec::new();
                 for t in &targets {
+                    let location = self.to_lsp_location(t);
+                    if let Some(ref location) = location {
+                        defs.push(location.clone());
+                        if location_is_within_project_root(project_root_path, location) {
+                            continue;
+                        }
+                    }
                     let Some(qualname) = python_lexical_qualname_for_definition_target(
                         transaction,
                         &self.state,
@@ -2984,13 +2991,6 @@ impl Server {
                         continue;
                     }
                     let fqn = format!("py:///{module_name}:{qualname}");
-                    let location = self.to_lsp_location(t);
-                    if let Some(ref location) = location {
-                        if location_is_within_project_root(project_root_path, location) {
-                            defs.push(location.clone());
-                            continue;
-                        }
-                    }
                     def_identities.push(MuffetSemanticSnapshotDefIdentity {
                         fqn,
                         moniker: None,

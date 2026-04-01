@@ -1,0 +1,3 @@
+LOCAL_VALUE = 1
+
+value = LOCAL_VALUE
